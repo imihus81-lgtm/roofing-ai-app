@@ -1,5 +1,8 @@
+streamlit
+pillow
+pydantic
+reportlab
+python-dotenv
 openai>=1.0.0
-streamlit>=1.28.0
-stripe>=8.0.0
-python-dotenv>=1.0.0
-pillow>=10.0.0
+stripe
+10.0.0
