@@ -1,19 +1,20 @@
-# main.py
+# app.py
 # RoofGuard AI — Roof Damage Analysis (Streamlit)
-# v2.2.0 (launch-ready)
-# - USA-only soft gate (state/ZIP)
-# - "Report depth" (Recommended / Quick scan / Detailed assessment)
-# - 4o-mini default; escalate worst image to 4o when needed
-# - Stripe Checkout + Billing Portal (cancel/update card)
-# - Supabase email-OTP login (require for subs/5-pack)
-# - Session report history + optional Supabase Storage cloud history
-# - PDF with embedded photos; Markdown download too
-# - Email UI auto-hidden without creds
+# v2.3.0
+# - USA soft gate
+# - Credits policy knobs (via Secrets): 1 credit includes N photos, +1 per step
+# - Multi-photo credit deduction with subscription/paid/free handling
+# - Report depth (Quick / Recommended / Detailed)
+# - 4o-mini default; escalate worst to 4o when needed
+# - Stripe Checkout + Billing Portal
+# - Supabase email-OTP login; optional cloud history in Supabase Storage
+# - PDF with embedded photos; Markdown too
+# - Email optional (auto-hidden without creds)
 # - st.query_params (no experimental API)
-# - Optional sample report link + promo note
-# - HEIC support; basic image-quality hints
+# - HEIC support; image quality hints
+# - No early references to uploaded_files (fixes NameError)
 
-import os, io, time, base64, uuid, tempfile, re, json
+import os, io, time, base64, uuid, tempfile, re, json, math
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any, Union
 
@@ -30,48 +31,44 @@ try:
 except Exception:
     pass
 
-# PDF
+# PDF bits
 from reportlab.lib.pagesizes import LETTER
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as PDFImage, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-# Payments (optional)
+# Optional libs
 try:
     import stripe
 except Exception:
     stripe = None
 
-# Email (optional)
 try:
     import yagmail
 except Exception:
     yagmail = None
 
-# OpenAI v1
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
-# Supabase (optional, for login & storage)
 try:
     from supabase import create_client, Client
 except Exception:
     create_client = None
     Client = None
 
-# ===== Branding / Config =====
+# ===================== App config / branding =====================
 APP_NAME = "RoofGuard AI"
-APP_VERSION = "2.2.0"
-
+APP_VERSION = "2.3.0"
 COMPANY_NAME = "RoofGuard AI"
 COMPANY_EMAIL = "support@roofguard.ai"
 COMPANY_PHONE = "+1 (555) 123-4567"
 COMPANY_WEBSITE = "https://roofguard.ai"
-COMPANY_LOGO_PATH = ""  # set via sidebar upload per-session
+COMPANY_LOGO_PATH = ""  # set per-session via upload
 
 COOLDOWN_SECONDS = 10
-LAUNCH_US_ONLY = True  # U.S. soft launch gate
+LAUNCH_US_ONLY = True
 
 DISCLAIMER = (
     "This is an AI-assisted visual assessment based on provided imagery. "
@@ -81,7 +78,7 @@ DISCLAIMER = (
 
 st.set_page_config(page_title=f"{APP_NAME} — Roof Damage Analysis", page_icon="🏠", layout="wide")
 
-# ===== Secrets / Keys =====
+# ===================== Secrets / env helpers =====================
 load_dotenv(find_dotenv(), override=True)
 
 def get_secret(env_key: str, secrets_key: Optional[str] = None, default: Optional[str] = None) -> Optional[str]:
@@ -98,11 +95,17 @@ def _mask(s: Optional[str]) -> str:
         return "MISSING"
     return f"{s[:4]}…{s[-4:]} (len={len(s)})"
 
+def _int_secret(env_key, secret_key, default):
+    try:
+        return int(os.getenv(env_key) or st.secrets.get(secret_key, default))
+    except Exception:
+        return default
+
 OPENAI_API_KEY    = get_secret("OPENAI_API_KEY",    "openai_api_key")
 STRIPE_SECRET_KEY = get_secret("STRIPE_SECRET_KEY", "stripe_secret_key")
 APP_BASE_URL      = get_secret("APP_BASE_URL",      "app_base_url") or "http://localhost:8501"
 
-# Stripe Price IDs (create in Stripe and set in Secrets)
+# Stripe prices
 PRICE_SINGLE_ID   = get_secret("STRIPE_PRICE_SINGLE",  "stripe_price_single")
 PRICE_5PACK_ID    = get_secret("STRIPE_PRICE_5PACK",   "stripe_price_5pack")
 PRICE_MONTHLY_ID  = get_secret("STRIPE_PRICE_MONTHLY", "stripe_price_monthly")
@@ -113,14 +116,21 @@ PRIVACY_URL       = get_secret("PRIVACY_URL", "privacy_url") or "#"
 ACCESS_CODE       = get_secret("ACCESS_CODE", "access_code") or ""
 MAINT_MODE        = str(get_secret("MAINTENANCE_MODE", "maintenance_mode") or "0").strip().lower() in ("1","true","yes")
 
-# Optional: sample links & promo note
+# Optional header links
 SAMPLE_REPORT_URL = get_secret("SAMPLE_REPORT_URL", "sample_report_url")
 PRICING_FAQ_URL   = get_secret("PRICING_FAQ_URL",   "pricing_faq_url")
-PROMO_NOTE        = get_secret("PROMO_NOTE",        "promo_note")  # e.g., "Use code EARLY50 for 50% off your first report."
+PROMO_NOTE        = get_secret("PROMO_NOTE",        "promo_note")
 
-# Optional: default depth from env/secrets
+# Report depth default
 DEFAULT_DEPTH = (os.getenv("DEFAULT_DEPTH") or get_secret("DEFAULT_DEPTH", "default_depth") or "Recommended").strip()
 
+# Credits knobs (editable via Secrets monthly)
+CREDITS_BASE_INCLUDED = _int_secret("CREDITS_BASE_INCLUDED", "credits_base_included", 6)  # photos included in 1 credit
+CREDITS_EXTRA_STEP    = _int_secret("CREDITS_EXTRA_STEP",    "credits_extra_step",    3)  # +1 credit per this many extra photos
+MAX_PHOTOS            = _int_secret("MAX_PHOTOS",            "max_photos",            12) # safety cap per report
+FREE_GRANT_DEFAULT    = _int_secret("FREE_TOTAL_GRANT",      "free_total_grant",      3)  # free reports per user
+
+# Initialize API clients
 client: Optional[OpenAI] = None
 if OPENAI_API_KEY and OpenAI:
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -130,7 +140,7 @@ if STRIPE_SECRET_KEY and stripe:
 
 LIVE_MODE = bool(STRIPE_SECRET_KEY and STRIPE_SECRET_KEY.startswith("sk_live"))
 
-# ===== Currency & Region =====
+# ===================== Currency / Regions =====================
 CURRENCY_SYMBOL = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥"}
 FX_MAP = {("USD","USD"):1.0, ("USD","EUR"):0.92, ("USD","GBP"):0.78, ("USD","JPY"):155.0}
 US_REGION_MULTIPLIER = {"National average":1.00, "Northeast":1.18, "Midwest":0.95, "South":0.92, "West":1.20}
@@ -155,9 +165,9 @@ def apply_region_multiplier(usd: float, region: str) -> float:
 def fmt_currency_block(usd: float, currency: str, region: str) -> str:
     return fmt_money_both(apply_region_multiplier(usd, region), currency)
 
-# ===== Entitlements (session only; persist later via DB/webhooks) =====
+# ===================== Entitlements =====================
 def init_entitlements():
-    st.session_state.setdefault("free_total_grant", 3)
+    st.session_state.setdefault("free_total_grant", FREE_GRANT_DEFAULT)
     st.session_state.setdefault("free_total_used", 0)
     st.session_state.setdefault("purchased_credits", 0)
     st.session_state.setdefault("unlimited_until", None)  # iso str
@@ -174,7 +184,7 @@ def entitlements_status() -> Dict[str, Any]:
         except Exception:
             u = None
     return {
-        "free_total_grant": st.session_state.get("free_total_grant", 3),
+        "free_total_grant": st.session_state.get("free_total_grant", FREE_GRANT_DEFAULT),
         "free_total_used":  st.session_state.get("free_total_used", 0),
         "purchased_credits": st.session_state.get("purchased_credits", 0),
         "unlimited_until": u,
@@ -202,7 +212,34 @@ def consume_credit():
         return
     st.session_state["free_total_used"] = s["free_total_used"] + 1
 
-# ===== Data & AI =====
+# Multi-credit helpers (new)
+def can_generate_needed(needed: int):
+    s = entitlements_status()
+    now = datetime.now()
+    if s["unlimited_until"] and s["unlimited_until"] > now:
+        return True, "Subscription active"
+    available = s["purchased_credits"] + max(0, s["free_total_grant"] - s["free_total_used"])
+    if available >= needed:
+        return True, f"Credits available: {available} (need {needed})"
+    return False, f"Need {needed} credits but only {available} available."
+
+def consume_credits(needed: int) -> None:
+    now = datetime.now()
+    u = st.session_state.get("unlimited_until")
+    if isinstance(u, str):
+        try:
+            u = datetime.fromisoformat(u)
+        except Exception:
+            u = None
+    if u and u > now:
+        return
+    for _ in range(needed):
+        if st.session_state.get("purchased_credits", 0) > 0:
+            st.session_state["purchased_credits"] -= 1
+        elif st.session_state.get("free_total_used", 0) < st.session_state.get("free_total_grant", FREE_GRANT_DEFAULT):
+            st.session_state["free_total_used"] += 1
+
+# ===================== AI / Vision =====================
 class RoofAssessment(BaseModel):
     damage_percentage: float = Field(ge=0, le=100)
     urgency: int = Field(ge=1, le=10)
@@ -242,7 +279,7 @@ def try_extract_json(text: str) -> Optional[Dict[str, Any]]:
             return json.loads(m.group(0))
         except Exception:
             pass
-    # fallback: labeled lines (very defensive)
+    # very defensive fallback
     dp = re.search(r"Damage\s*Percentage:\s*([\d.]+)", text, re.I)
     ur = re.search(r"Urgency\s*Level:\s*(\d+)", text, re.I)
     es = re.search(r"Repair\s*Estimate:\s*\$?\s*([\d.]+)", text, re.I)
@@ -264,7 +301,7 @@ def call_openai_vision(img_b64: str, prefer: Optional[List[str]] = None) -> Tupl
     if not img_b64 or len(img_b64) < 200:
         return None, "Error: encoded image appears empty."
     if prefer is None:
-        prefer = ["gpt-4o-mini", "gpt-4o"]  # default mini-first
+        prefer = ["gpt-4o-mini", "gpt-4o"]
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -295,14 +332,12 @@ def call_openai_vision(img_b64: str, prefer: Optional[List[str]] = None) -> Tupl
                 last_err = str(e)
     return None, f"OpenAI error: {last_err}"
 
-# ===== Report helpers =====
+# ===================== Report helpers =====================
 def new_report_id() -> str:
     return f"RG-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
 
 def _save_temp_jpeg(img: Image.Image, quality: int = 92) -> str:
-    im = img
-    if im.mode != "RGB":
-        im = im.convert("RGB")
+    im = img if img.mode == "RGB" else img.convert("RGB")
     MAX_W = 2000
     if im.width > MAX_W:
         r = MAX_W / float(im.width)
@@ -345,7 +380,6 @@ def has_email_creds() -> bool:
         and bool(get_secret("EMAIL_PASS", "email_pass"))
     )
 
-# Email helper (supports bcc)
 def send_email_pdf(to_addr: str, subject: str, body_lines: List[str], pdf_bytes: bytes, filename: str, bcc: Optional[List[str]] = None) -> Tuple[bool, Optional[str]]:
     sender = get_secret("EMAIL_USER", "email_user")
     pwd    = get_secret("EMAIL_PASS", "email_pass")
@@ -361,27 +395,16 @@ def send_email_pdf(to_addr: str, subject: str, body_lines: List[str], pdf_bytes:
     except Exception as e:
         return False, str(e)
 
-# Markdown report
 def build_markdown_report(
-    report_id: str,
-    ts: str,
-    customer_name: str,
-    address: str,
-    notes: str,
-    currency: str,
-    region: str,
+    report_id: str, ts: str, customer_name: str, address: str, notes: str,
+    currency: str, region: str,
     assessments: List[Tuple[str, RoofAssessment, Image.Image]],
-    summary_text: str,
-    tech_name: str,
-    tech_license: str,
-    tech_phone: str,
+    summary_text: str, tech_name: str, tech_license: str, tech_phone: str,
 ) -> str:
     lines: List[str] = []
     logo_md = embed_logo_md(COMPANY_LOGO_PATH)
     if logo_md:
-        lines.append(logo_md)
-        lines.append("")
-
+        lines.append(logo_md); lines.append("")
     lines.append(f"**{COMPANY_NAME}**  \n{COMPANY_EMAIL} • {COMPANY_PHONE} • {COMPANY_WEBSITE}")
     lines.append("")
     lines.append(f"# {APP_NAME} — Roof Damage Report")
@@ -390,25 +413,18 @@ def build_markdown_report(
     lines.append(f"**Customer:** {customer_name or 'N/A'}")
     lines.append(f"**Address:** {address or 'N/A'}")
     lines.append(f"**Region (cost basis):** {region}")
-    if notes:
-        lines.append(f"**Notes:** {notes}")
+    if notes: lines.append(f"**Notes:** {notes}")
     lines.append("")
-
     if tech_name or tech_license or tech_phone:
         lines.append("## Prepared By")
-        if tech_name:
-            lines.append(f"- **Technician:** {tech_name}")
-        if tech_license:
-            lines.append(f"- **License/Cert #:** {tech_license}")
-        if tech_phone:
-            lines.append(f"- **Contact:** {tech_phone}")
+        if tech_name: lines.append(f"- **Technician:** {tech_name}")
+        if tech_license: lines.append(f"- **License/Cert #:** {tech_license}")
+        if tech_phone: lines.append(f"- **Contact:** {tech_phone}")
         lines.append("")
-
     if summary_text:
         lines.append("## Summary of Findings")
         lines.append(summary_text)
         lines.append("")
-
     for idx, (fname, a, img) in enumerate(assessments, start=1):
         lines.append(f"## Image {idx} — {fname}")
         lines.append(f"- **Damage %:** {a.damage_percentage:.1f}%")
@@ -418,31 +434,18 @@ def build_markdown_report(
         lines.append(f"- **Recommendation:** {a.recommendation.strip()}")
         lines.append(f"- {confidence_note(a)}")
         lines.append("")
-        lines.append(embed_img_md(img))
-        lines.append("")
-
+        lines.append(embed_img_md(img)); lines.append("")
     lines.append(f"---\n*{DISCLAIMER}*")
     return "\n".join(lines)
 
-# PDF report
 def build_pdf_report(
-    report_id: str,
-    ts: str,
-    customer_name: str,
-    address: str,
-    notes: str,
-    currency: str,
-    region: str,
+    report_id: str, ts: str, customer_name: str, address: str, notes: str,
+    currency: str, region: str,
     assessments: List[Tuple[str, RoofAssessment, Image.Image]],
-    summary_text: str,
-    tech_name: str,
-    tech_license: str,
-    tech_phone: str,
-    hires_photo: bool
+    summary_text: str, tech_name: str, tech_license: str, tech_phone: str, hires_photo: bool
 ) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=LETTER)
-
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="Small", fontSize=8, leading=10))
     H1 = styles["Heading1"]; H1.fontName = "Helvetica-Bold"
@@ -451,18 +454,13 @@ def build_pdf_report(
     N  = styles["Normal"];   N.fontName  = "Helvetica"
 
     story: List[Any] = []
-    story.append(Paragraph(f"{APP_NAME} — Roof Damage Report", H1))
-    story.append(Spacer(1, 8))
-
+    story.append(Paragraph(f"{APP_NAME} — Roof Damage Report", H1)); story.append(Spacer(1, 8))
     if COMPANY_LOGO_PATH and os.path.exists(COMPANY_LOGO_PATH):
         try:
-            story.append(PDFImage(COMPANY_LOGO_PATH, width=160))
-            story.append(Spacer(1, 6))
-        except Exception:
-            pass
+            story.append(PDFImage(COMPANY_LOGO_PATH, width=160)); story.append(Spacer(1, 6))
+        except Exception: pass
     story.append(Paragraph(f"<b>{COMPANY_NAME}</b> • {COMPANY_EMAIL} • {COMPANY_PHONE} • {COMPANY_WEBSITE}", N))
     story.append(Spacer(1, 8))
-
     meta = (
         f"<b>Report ID:</b> {report_id}<br/>"
         f"<b>Date:</b> {ts}<br/>"
@@ -471,21 +469,16 @@ def build_pdf_report(
         f"<b>Region (cost):</b> {region}<br/>"
         f"<b>Notes:</b> {notes or 'N/A'}"
     )
-    story.append(Paragraph(meta, N))
-    story.append(Spacer(1, 10))
-
+    story.append(Paragraph(meta, N)); story.append(Spacer(1, 10))
     prep = []
     if tech_name:    prep.append(f"<b>Prepared by:</b> {tech_name}")
     if tech_license: prep.append(f"<b>License/Cert #:</b> {tech_license}")
     if tech_phone:   prep.append(f"<b>Contact:</b> {tech_phone}")
     if prep:
-        story.append(Paragraph("<br/>".join(prep), N))
-        story.append(Spacer(1, 10))
-
+        story.append(Paragraph("<br/>".join(prep), N)); story.append(Spacer(1, 10))
     if summary_text:
         story.append(Paragraph("Summary of Findings", H2))
-        story.append(Paragraph(summary_text, N))
-        story.append(Spacer(1, 12))
+        story.append(Paragraph(summary_text, N)); story.append(Spacer(1, 12))
 
     FRAME_W = doc.width
     TARGET_W = min(FRAME_W, 500 if hires_photo else 400)
@@ -494,10 +487,8 @@ def build_pdf_report(
         section: List[Any] = [Paragraph(f"Image {idx} — {fname}", H3)]
         try:
             jpg_path = _save_temp_jpeg(img, quality=92)
-            w, h = img.size
-            w = max(1, w)
-            scale = TARGET_W / float(w)
-            target_h = h * scale
+            w, h = img.size; w = max(1, w)
+            scale = TARGET_W / float(w); target_h = h * scale
             section.append(PDFImage(jpg_path, width=TARGET_W, height=target_h))
         except Exception as e:
             section.append(Paragraph(f"[Image could not be embedded: {e}]", N))
@@ -510,14 +501,12 @@ def build_pdf_report(
             f"{confidence_note(a)}"
         )
         section.append(Paragraph(details, N))
-        story.append(KeepTogether(section))
-        story.append(Spacer(1, 12))
-
+        story.append(KeepTogether(section)); story.append(Spacer(1, 12))
     story.append(Paragraph(DISCLAIMER, styles["Small"]))
     doc.build(story)
     return buf.getvalue()
 
-# ===== Stripe helpers =====
+# ===================== Stripe helpers =====================
 def create_billing_portal(customer_id: str) -> Optional[str]:
     if not (stripe and STRIPE_SECRET_KEY and customer_id):
         return None
@@ -531,7 +520,7 @@ def create_billing_portal(customer_id: str) -> Optional[str]:
         st.sidebar.error(f"Billing portal error: {e}")
         return None
 
-# ===== Supabase helpers (auth + storage) =====
+# ===================== Supabase (auth + storage) =====================
 def get_supabase() -> Optional["Client"]:
     url = get_secret("SUPABASE_URL", "supabase_url")
     key = get_secret("SUPABASE_ANON_KEY", "supabase_anon_key")
@@ -543,36 +532,23 @@ def get_supabase() -> Optional["Client"]:
         return None
 
 def ensure_auth_ui() -> bool:
-    """
-    Renders login UI in the sidebar.
-    Returns True if the user is signed in (session_state['user_email'] is set).
-    """
     sb = get_supabase()
     st.sidebar.markdown("### 👤 Account")
-
     if not sb:
-        # Login disabled if no Supabase keys; keep Singles usable
         if st.session_state.get("user_email"):
             st.sidebar.success(f"Signed in as {st.session_state['user_email']}")
             if st.sidebar.button("Sign out"):
-                st.session_state.pop("user_email", None)
-                st.rerun()
+                st.session_state.pop("user_email", None); st.rerun()
             return True
         st.sidebar.caption("Login disabled (no Supabase keys).")
         return False
-
-    # Already signed in?
     if st.session_state.get("user_email"):
         st.sidebar.success(f"Signed in as {st.session_state['user_email']}")
         if st.sidebar.button("Sign out"):
-            st.session_state.pop("user_email", None)
-            st.rerun()
+            st.session_state.pop("user_email", None); st.rerun()
         return True
-
-    # Not signed in → OTP flow
     email = st.sidebar.text_input("Email for login", key="login_email")
     col_s, col_v = st.sidebar.columns([1, 1])
-
     if col_s.button("Send code"):
         if not email or "@" not in email:
             st.sidebar.error("Enter a valid email.")
@@ -582,7 +558,6 @@ def ensure_auth_ui() -> bool:
                 st.sidebar.info("Verification code sent. Check your inbox.")
             except Exception as e:
                 st.sidebar.error(f"Send code failed: {e}")
-
     code = st.sidebar.text_input("Enter 6-digit code", key="login_code")
     if col_v.button("Verify"):
         if not (email and code):
@@ -591,11 +566,9 @@ def ensure_auth_ui() -> bool:
             try:
                 sb.auth.verify_otp({"email": email, "token": code, "type": "email"})
                 st.session_state["user_email"] = email.strip()
-                st.sidebar.success("Logged in.")
-                st.rerun()
+                st.sidebar.success("Logged in."); st.rerun()
             except Exception as e:
                 st.sidebar.error(f"Verify failed: {e}")
-
     return False
 
 def supabase_enabled() -> bool:
@@ -606,35 +579,22 @@ def supabase_enabled() -> bool:
     )
 
 def save_report_to_supabase(
-    user_email: str,
-    report_id: str,
-    md_text: str,
-    pdf_bytes: bytes,
-    meta: dict
+    user_email: str, report_id: str, md_text: str, pdf_bytes: bytes, meta: dict
 ) -> Tuple[bool, Union[str, Dict[str, str]]]:
-    """
-    Saves PDF, Markdown, and a small meta.json into a public storage bucket.
-    Also maintains a simple per-user index.json for easy listing.
-    """
     sb = get_supabase()
     if not (sb and supabase_enabled()):
         return False, "Supabase not configured."
-
     bucket = get_secret("SUPABASE_REPORTS_BUCKET", "supabase_reports_bucket") or "reports"
     user_folder = (user_email or "guest").replace("/", "_")
     prefix = f"{user_folder}/{report_id}"
-
     try:
         storage = sb.storage.from_(bucket)
-
         storage.upload(f"{prefix}/report.pdf", pdf_bytes, {"contentType": "application/pdf", "upsert": True})
         storage.upload(f"{prefix}/report.md", md_text.encode("utf-8"), {"contentType": "text/markdown", "upsert": True})
         storage.upload(f"{prefix}/meta.json", json.dumps(meta).encode("utf-8"), {"contentType": "application/json", "upsert": True})
-
         pdf_url = storage.get_public_url(f"{prefix}/report.pdf")
         md_url  = storage.get_public_url(f"{prefix}/report.md")
-
-        # Maintain a lightweight index for quick listing
+        # maintain simple index
         idx_path = f"{user_folder}/index.json"
         try:
             existing = []
@@ -644,7 +604,6 @@ def save_report_to_supabase(
                 existing = json.loads(text)
             except Exception:
                 existing = []
-
             existing.append({
                 "created_at": meta.get("created_at"),
                 "report_id": report_id,
@@ -658,12 +617,10 @@ def save_report_to_supabase(
                 "pdf_url": pdf_url,
                 "md_url": md_url,
             })
-
             storage.upload(idx_path, json.dumps(existing).encode("utf-8"),
                            {"contentType": "application/json", "upsert": True})
         except Exception:
             pass
-
         return True, {"pdf_url": pdf_url, "md_url": md_url}
     except Exception as e:
         return False, str(e)
@@ -672,12 +629,10 @@ def list_reports_from_supabase(user_email: str) -> List[Dict[str, Any]]:
     sb = get_supabase()
     if not (sb and supabase_enabled()):
         return []
-
     bucket = get_secret("SUPABASE_REPORTS_BUCKET", "supabase_reports_bucket") or "reports"
     storage = sb.storage.from_(bucket)
     user_folder = (user_email or "guest").replace("/", "_")
     idx_path = f"{user_folder}/index.json"
-
     try:
         raw = storage.download(idx_path)
         text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
@@ -686,23 +641,19 @@ def list_reports_from_supabase(user_email: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-# ===== UI =====
+# ===================== UI =====================
 st.title(f"🏠 {APP_NAME}")
 mode_label = "LIVE" if LIVE_MODE else "TEST"
 st.caption(f"Professional Roof Damage Analysis & Reporting • v{APP_VERSION} • Stripe: {mode_label}")
 
-# Optional header links
 header_bits = []
-if SAMPLE_REPORT_URL:
-    header_bits.append(f"[View a sample report]({SAMPLE_REPORT_URL})")
-if PRICING_FAQ_URL:
-    header_bits.append(f"[Pricing & FAQs]({PRICING_FAQ_URL})")
-if header_bits:
-    st.markdown(" · ".join(header_bits))
+if SAMPLE_REPORT_URL: header_bits.append(f"[View a sample report]({SAMPLE_REPORT_URL})")
+if PRICING_FAQ_URL:   header_bits.append(f"[Pricing & FAQs]({PRICING_FAQ_URL})")
+if header_bits: st.markdown(" · ".join(header_bits))
 
 init_entitlements()
 
-# Sidebar — keys/base URL + logo uploader
+# Sidebar basics
 st.sidebar.caption(f"OpenAI: {_mask(OPENAI_API_KEY)} | Stripe: {_mask(STRIPE_SECRET_KEY)}")
 st.sidebar.caption(f"Base URL: {APP_BASE_URL}")
 
@@ -715,14 +666,13 @@ with st.sidebar.expander("Branding"):
         except Exception as e:
             st.warning(f"Logo not set: {e}")
 
-# Promo note
 if PROMO_NOTE:
     st.sidebar.info(PROMO_NOTE)
 
-# Auth UI (optional; require for subs)
+# Auth UI
 logged_in = ensure_auth_ui()
 
-# Country gate (USA soft launch)
+# Country gate
 st.markdown("### Customer / Site Info")
 country = st.selectbox("Country", ["United States", "Other"], index=0)
 if LAUNCH_US_ONLY and country != "United States":
@@ -745,17 +695,15 @@ with us_col2:
 currency = st.sidebar.selectbox("Currency", ["USD", "EUR", "GBP", "JPY"], index=0)
 region = st.sidebar.selectbox("US region (cost basis)", list(US_REGION_MULTIPLIER.keys()), index=0)
 
-# Report depth (customer-friendly)
+# Report depth
 depth_options = ["Recommended", "Quick scan", "Detailed assessment"]
 default_idx = depth_options.index(DEFAULT_DEPTH) if DEFAULT_DEPTH in depth_options else 0
 depth_choice = st.sidebar.selectbox(
-    "Report depth",
-    depth_options,
-    index=default_idx,
+    "Report depth", depth_options, index=default_idx,
     help="Quick = fastest triage. Detailed = deeper assessment for insurance."
 )
 
-# Advanced (admin-only) — hi-res toggle
+# Access code / advanced
 passed_access = True
 if ACCESS_CODE:
     st.sidebar.markdown("### 🔒 Access")
@@ -771,25 +719,19 @@ if passed_access:
 else:
     hires_pdf = False
 
-# Email preferences (hidden if no creds)
+# Email prefs (hidden if no creds)
 st.session_state.setdefault("auto_email_me", False)
 st.session_state.setdefault("auto_email_customer", False)
 st.session_state.setdefault("bcc_me", False)
 if has_email_creds():
     st.sidebar.markdown("### ✉️ Email preferences")
-    st.session_state["auto_email_me"] = st.sidebar.checkbox(
-        "Auto email me each report", value=st.session_state["auto_email_me"]
-    )
-    st.session_state["auto_email_customer"] = st.sidebar.checkbox(
-        "Auto email customer (requires consent)", value=st.session_state["auto_email_customer"]
-    )
-    st.session_state["bcc_me"] = st.sidebar.checkbox(
-        "BCC me on customer emails", value=st.session_state["bcc_me"]
-    )
+    st.session_state["auto_email_me"] = st.sidebar.checkbox("Auto email me each report", value=st.session_state["auto_email_me"])
+    st.session_state["auto_email_customer"] = st.sidebar.checkbox("Auto email customer (requires consent)", value=st.session_state["auto_email_customer"])
+    st.session_state["bcc_me"] = st.sidebar.checkbox("BCC me on customer emails", value=st.session_state["bcc_me"])
 else:
     st.sidebar.caption("✉️ Email disabled (no EMAIL_USER/EMAIL_PASS set).")
 
-# Maintenance & missing keys
+# Maintenance / key checks
 if MAINT_MODE:
     st.sidebar.error("Maintenance mode ON — analysis disabled.")
 if not OPENAI_API_KEY:
@@ -810,14 +752,12 @@ st.sidebar.write(
 # Plans / Checkout
 st.sidebar.markdown("### 💳 Plans")
 st.sidebar.write("• Pay-as-you-go or monthly • First 3 reports free • Cancel anytime")
-
 plan_choice = st.sidebar.selectbox("Choose plan", ["Single $49", "5-Pack $199", "Monthly $299"])
 annual = False
 if "Monthly" in plan_choice:
     annual = st.sidebar.checkbox("Bill annually (2 months free)", value=False)
 
 if st.sidebar.button("Checkout"):
-    # Require login for 5-Pack & Monthly; allow Single without login
     needs_login = ("Monthly" in plan_choice) or ("5-Pack" in plan_choice)
     if needs_login and not logged_in:
         st.sidebar.warning("Please sign in (email code) before purchasing a subscription or 5-pack so your credits persist across devices.")
@@ -850,20 +790,18 @@ if st.sidebar.button("Checkout"):
                 except Exception as e:
                     st.sidebar.error(f"Stripe error: {e}")
 
-# Billing portal (self-serve cancel/update)
+# Billing portal
 st.sidebar.markdown("### 🧾 Billing")
 cust_id = st.session_state.get("stripe_customer_id")
 if cust_id and stripe and STRIPE_SECRET_KEY:
     if st.sidebar.button("Manage subscription / billing"):
         url = create_billing_portal(cust_id)
-        if url:
-            st.sidebar.markdown(f"[Open Billing Portal →]({url})")
-        else:
-            st.sidebar.warning("Could not open portal. Try again.")
+        if url: st.sidebar.markdown(f"[Open Billing Portal →]({url})")
+        else:   st.sidebar.warning("Could not open portal. Try again.")
 else:
     st.sidebar.caption("Billing portal available after your first successful purchase.")
 
-# Handle success redirect & capture Stripe customer_id
+# Handle success redirect
 qp = st.query_params
 def _param(key, default=""):
     v = qp.get(key, default)
@@ -875,7 +813,6 @@ if _param("checkout") == "success":
     plan = _param("plan")
     is_annual = _param("annual", "0") == "1"
     session_id = _param("session_id")
-
     if "5-Pack" in plan:
         st.session_state["purchased_credits"] = st.session_state.get("purchased_credits", 0) + 5
         st.success("Purchased 5 credits added to your account.")
@@ -886,7 +823,6 @@ if _param("checkout") == "success":
         days = 365 if is_annual else 30
         st.session_state["unlimited_until"] = (datetime.now() + timedelta(days=days)).isoformat()
         st.success(("Annual" if is_annual else "Monthly") + " unlimited activated.")
-
     if stripe and STRIPE_SECRET_KEY and session_id:
         try:
             cs = stripe.checkout.Session.retrieve(session_id, expand=["customer"])
@@ -895,10 +831,9 @@ if _param("checkout") == "success":
             st.info("Billing profile saved. You can manage your subscription from the sidebar.")
         except Exception as e:
             st.warning(f"Could not capture billing profile: {e}")
-
     st.query_params.clear()
 
-# ===== Customer details =====
+# ===================== Customer details =====================
 colA, colB = st.columns(2)
 with colA:
     customer_name = st.text_input("Customer Name")
@@ -929,19 +864,12 @@ accept_terms = st.checkbox(
     value=False
 )
 
-# Email consent + validation
-def is_valid_email(s: str) -> bool:
-    try:
-        return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", s.strip()))
-    except Exception:
-        return False
-
 email_consent = st.checkbox(
     "I confirm I have the customer's permission to email them this report",
     value=False, help="Required if you enable auto email to customer."
 )
 
-# Upload images
+# ===================== Upload images =====================
 st.markdown("### Upload Roof Images")
 uploaded_files = st.file_uploader(
     "Upload one or more images (JPG/PNG/HEIC)",
@@ -949,7 +877,13 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
+# Preview & cap (no NameError risk)
 if uploaded_files:
+    # Cap photos for cost control
+    if len(uploaded_files) > MAX_PHOTOS:
+        st.warning(f"Showing first {MAX_PHOTOS} photos. To analyze more, make an additional report.")
+        uploaded_files = uploaded_files[:MAX_PHOTOS]
+
     st.write("**Preview**")
     cols = st.columns(4)
     for i, f in enumerate(uploaded_files):
@@ -961,7 +895,7 @@ if uploaded_files:
         finally:
             f.seek(0)
 
-# Cooldown
+# Cooldown guard
 allow_time = True
 if "last_ts" in st.session_state:
     elapsed = time.time() - st.session_state["last_ts"]
@@ -969,23 +903,15 @@ if "last_ts" in st.session_state:
         allow_time = False
         st.info(f"Cooldown: wait {int(COOLDOWN_SECONDS - elapsed)}s before next run.")
 
-# Analyze enablement
-analyze_disabled = (
-    MAINT_MODE or
-    not allow_time or
-    not accept_terms
-)
+analyze_disabled = (MAINT_MODE or not allow_time or not accept_terms)
 
-# Model mapping for "Report depth"
 def models_for_depth(depth: str, image_count: int) -> List[str]:
     if depth == "Quick scan":
         return ["gpt-4o-mini", "gpt-4o"]
     if depth == "Detailed assessment":
         return ["gpt-4o", "gpt-4o-mini"]
-    # Recommended (auto): mini first for ≤3 photos; 4o first if more
     return ["gpt-4o-mini", "gpt-4o"] if image_count <= 3 else ["gpt-4o", "gpt-4o-mini"]
 
-# Quick image quality guard
 def quick_image_quality_note(img: Image.Image) -> Optional[str]:
     g = np.array(img.convert("L"), dtype=np.uint8)
     mean = float(g.mean()); var = float(g.var())
@@ -994,25 +920,39 @@ def quick_image_quality_note(img: Image.Image) -> Optional[str]:
     if var < 200:  return "Image may be blurry/low-detail. Try a steadier shot or closer view."
     return None
 
+# ===================== Analyze button =====================
 if st.button("Analyze & Generate Report", type="primary", disabled=analyze_disabled):
-    ok, reason = can_generate_now()
+    # Credits calculation happens HERE (after uploader exists)
+    imgs = len(uploaded_files or [])
+    if imgs == 0:
+        st.error("Please upload at least one image."); st.stop()
+
+    # Credits needed: 1 covers base, +1 per extra step
+    if imgs <= CREDITS_BASE_INCLUDED:
+        credits_needed = 1
+    else:
+        credits_needed = 1 + math.ceil((imgs - CREDITS_BASE_INCLUDED) / CREDITS_EXTRA_STEP)
+
+    st.caption(
+        f"Credits needed for {imgs} photo(s): {credits_needed} "
+        f"(1 credit covers up to {CREDITS_BASE_INCLUDED} photos; +1 per {CREDITS_EXTRA_STEP} extra)."
+    )
+
+    ok, reason = can_generate_needed(credits_needed)
     if not ok:
         st.error(reason); st.stop()
-    if not uploaded_files:
-        st.error("Please upload at least one image."); st.stop()
 
     assessments: List[Tuple[str, RoofAssessment, Image.Image]] = []
     progress = st.progress(0.0); status = st.empty()
 
-    prefer = models_for_depth(depth_choice, len(uploaded_files or []))
+    prefer = models_for_depth(depth_choice, imgs)
 
     for idx, f in enumerate(uploaded_files, start=1):
-        status.write(f"Analyzing image {idx}/{len(uploaded_files)} …")
+        status.write(f"Analyzing image {idx}/{imgs} …")
         try:
             pil = normalize_image(f)
             qnote = quick_image_quality_note(pil)
-            if qnote:
-                st.info(f"{f.name}: {qnote}")
+            if qnote: st.info(f"{f.name}: {qnote}")
             img_b64 = image_to_b64(pil)
             a, raw = call_openai_vision(img_b64, prefer=prefer)
             if a is None:
@@ -1022,14 +962,13 @@ if st.button("Analyze & Generate Report", type="primary", disabled=analyze_disab
         except Exception as e:
             st.error(f"Error with {f.name}: {e}")
         finally:
-            progress.progress(idx/len(uploaded_files))
-            f.seek(0)
+            progress.progress(idx/imgs); f.seek(0)
 
     status.write("Analysis complete.")
     if not assessments:
         st.error("No valid analyses produced."); st.stop()
 
-    # OPTIONAL: escalate one worst image if quick modes
+    # Optional escalate worst to 4o (for quick modes)
     def needs_escalation(a: RoofAssessment) -> bool:
         if a.urgency >= 8 or a.damage_percentage >= 60:
             return True
@@ -1050,8 +989,10 @@ if st.button("Analyze & Generate Report", type="primary", disabled=analyze_disab
             except Exception:
                 pass
 
-    consume_credit()
+    # Deduct credits AFTER successful analysis
+    consume_credits(credits_needed)
 
+    # Summary & report
     avg_damage = sum(a.damage_percentage for _, a, __ in assessments) / len(assessments)
     max_urgency = max(a.urgency for _, a, __ in assessments)
     avg_est = sum(a.estimate_usd for _, a, __ in assessments) / len(assessments)
@@ -1069,8 +1010,7 @@ if st.button("Analyze & Generate Report", type="primary", disabled=analyze_disab
     st.write(f"- **State / ZIP:** {state} {zipcode or ''}")
     st.write(f"- **Region (cost basis):** {region}")
     st.write(f"- **Report depth:** {depth_choice}")
-    if notes:
-        st.write(f"- **Notes:** {notes}")
+    if notes: st.write(f"- **Notes:** {notes}")
 
     summary_text = (
         f"For {customer_name or 'the client'} at {address or 'the property'}, the roof shows ~{avg_damage:.0f}% average damage "
@@ -1096,20 +1036,12 @@ if st.button("Analyze & Generate Report", type="primary", disabled=analyze_disab
         hires_photo=hires_pdf
     )
 
-    st.download_button(
-        "⬇️ Download Report (Markdown)",
-        data=md_report.encode("utf-8"),
-        file_name=f"roof_report_{report_id}.md",
-        mime="text/markdown"
-    )
-    st.download_button(
-        "⬇️ Download Report (PDF)",
-        data=pdf_bytes,
-        file_name=f"roof_report_{report_id}.pdf",
-        mime="application/pdf"
-    )
+    st.download_button("⬇️ Download Report (Markdown)", data=md_report.encode("utf-8"),
+                       file_name=f"roof_report_{report_id}.md", mime="text/markdown")
+    st.download_button("⬇️ Download Report (PDF)", data=pdf_bytes,
+                       file_name=f"roof_report_{report_id}.pdf", mime="application/pdf")
 
-    # --- Local session history (no setup required) ---
+    # Local session history
     st.session_state.setdefault("local_reports", [])
     st.session_state["local_reports"].append({
         "created_at": ts,
@@ -1123,7 +1055,7 @@ if st.button("Analyze & Generate Report", type="primary", disabled=analyze_disab
         "avg_estimate_usd": round(sum(a.estimate_usd for _, a, __ in assessments) / len(assessments), 0),
     })
 
-    # --- Optional cloud history (Supabase) ---
+    # Cloud history
     if supabase_enabled() and logged_in:
         meta = {
             "created_at": ts,
@@ -1147,7 +1079,7 @@ if st.button("Analyze & Generate Report", type="primary", disabled=analyze_disab
     else:
         st.caption("Cloud history available when logged in with Supabase.")
 
-    # Email preview + sending (if creds exist)
+    # Email (optional)
     if has_email_creds():
         with st.expander("✉️ Email content preview"):
             me_subject   = st.text_input("Subject (to me)", value=f"RoofGuard Report {report_id}", key=f"me_subj_{report_id}")
@@ -1182,14 +1114,14 @@ if st.button("Analyze & Generate Report", type="primary", disabled=analyze_disab
 
             if (bool(st.session_state.get("auto_email_customer"))
                 and sender and pwd and customer_email
-                and is_valid_email(customer_email)
+                and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", customer_email or "")
                 and email_consent):
                 ok_send, err = send_email_pdf(customer_email, cust_subject, cust_body, pdf_bytes, f"roof_report_{report_id}.pdf", bcc=bcc_list)
                 if ok_send: st.success(f"Report emailed to {customer_email}.")
                 else:       st.warning(f"Email to customer failed: {err}")
             elif st.session_state.get("auto_email_customer") and customer_email and not email_consent:
                 st.info("Customer auto-email skipped (consent not checked).")
-            elif st.session_state.get("auto_email_customer") and customer_email and not is_valid_email(customer_email):
+            elif st.session_state.get("auto_email_customer") and customer_email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", customer_email or ""):
                 st.info("Customer auto-email skipped (invalid email).")
 
             st.session_state["emailed_reports"].append(report_id)
@@ -1200,7 +1132,7 @@ if st.button("Analyze & Generate Report", type="primary", disabled=analyze_disab
 
     st.session_state["last_ts"] = time.time()
 
-# --- History panels ---
+# ===================== History panels =====================
 with st.expander("📁 Reports (this session)"):
     hist = st.session_state.get("local_reports", [])
     if not hist:
@@ -1232,7 +1164,7 @@ if supabase_enabled() and logged_in:
                     f"[PDF]({pdf}) · [MD]({md})"
                 )
 
-# Footer
+# ===================== Footer =====================
 st.markdown("---")
 cols = st.columns(3)
 cols[0].markdown(f"[Terms of Service]({TERMS_URL})")
