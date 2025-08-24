@@ -5,3 +5,8 @@ pydantic>=2.6,<3
 reportlab==4.2.2
 python-dotenv==1.0.1
 stripe>=8,<10
+pillow-heif
+yagmail
+numpy
+supabase
+
